@@ -151,34 +151,28 @@ return torch.where(dt >= 0, survived.round().to(torch.int32), charge)
 
 ---
 
-## BUG-05 — `_ensure_tail_closer_to_anode` uses fragile in-place swap   {#tail-swap}
+## BUG-05 — `_ensure_tail_closer_to_anode` — naming and semantics corrected   {#tail-swap}
 
-**Severity:** nit (currently correct but fragile)  
-**Location:** `src/tred/graph.py:205`
+**FIXED in aa91c37** — renamed to `_order_step_endpoints_for_drift_time`;
+semantics corrected: `tail` is now the **upstream** endpoint (farther from
+anode for positive drift velocity), not the closer one.  The old name implied
+the opposite orientation.
 
-```python
-tail_new[swap_idx], head_new[swap_idx] = head_new[swap_idx].clone(), tail_new[swap_idx].clone()
-```
+**What was fixed:**  
+The method was renamed from `_ensure_tail_closer_to_anode` to
+`_order_step_endpoints_for_drift_time` (`graph.py:160`).  Its docstring
+now explicitly states: "If `velocity > 0`, the function ensures
+`tail[:, vaxis] <= head[:, vaxis]`" — i.e. tail has the *smaller* coordinate
+along the drift axis.  For positive drift toward the anode (which has a larger
+coordinate), this means tail is the upstream (farther-from-anode) endpoint.
+The old name `_ensure_tail_closer_to_anode` was misleading and implied the
+inverted semantics.
 
-**Problem:**  
-Python evaluates the right-hand side as a tuple before assigning; the
-`.clone()` calls prevent aliasing.  The code works correctly today.  However:
-1. The implementation clones *both* `tail` and `head` unconditionally at
-   `graph.py:188`, even when no swap is needed (e.g. `swap_idx` is empty).
-   This doubles the memory used for positions on every batch.
-2. The pattern is non-obvious and easy to break: if a future editor removes
-   either `.clone()`, the swap silently becomes wrong (both sides alias the
-   same modified tensor).
-
-**Fix direction:**  
-Use a temporary buffer:
-```python
-tmp = tail_new[swap_idx].clone()
-tail_new[swap_idx] = head_new[swap_idx]
-head_new[swap_idx] = tmp
-```
-Or avoid the unconditional clone by checking whether any swap is needed
-before allocating `tail_new` / `head_new`.
+**Residual note:**  
+The unconditional `tail.clone().detach(), head.clone().detach()` at
+`graph.py:197` still clones both endpoint tensors on every call regardless
+of whether a swap is needed — this memory cost remains.  See
+[04_memory.md](04_memory.md#drift-clone).
 
 ---
 
@@ -293,4 +287,39 @@ The intended check was probably `stride.dtype != offset_dtype`.
 **Fix direction:**
 ```python
 if stride.dtype != offset_dtype:
+```
+
+---
+
+## BUG-11 — Depo path received distance-unit sigma along drift axis   {#depo-sigma-units}
+
+**FIXED in aa91c37**
+
+**Location (pre-fix):** `src/tred/graph.py:Raster.forward`
+
+**Problem (as it was):**  
+In `Raster.forward`, the distance-to-time sigma conversion:
+```python
+sigma[:, self._tdim] = sigma[:, self._tdim] / torch.abs(self.velocity)
+```
+was applied only *after* the step/depo branch.  The step path correctly
+received sigma in time units because `_head_time_offset_from_tail` was
+computed using the already-spatial sigma; but the depo path (`raster_depos`)
+received the untransformed, distance-unit sigma along the drift axis.
+
+This caused the charge spread along the drift axis for point depos to be
+approximately `velocity` times too wide (since `velocity` is typically
+`~0.16 cm/µs` in ND-LAr units, the drift-axis sigma was off by this factor),
+yielding incorrect charge distributions for depo-mode rasterisation.
+
+**Fix (current):**  
+The sigma distance-to-time transform is now applied **before** the
+`if head is None` branch (`graph.py:331`), so both the depo path and the
+step path receive sigma in time units along `self._tdim`.  Confirmed in
+`graph.py:330–336`:
+```python
+sigma[:, self._tdim] = sigma[:, self._tdim] / torch.abs(self.velocity)
+...
+if head is None:        # depos, not steps
+    rasters, offsets = raster_depos(self.grid_spacing, tail, sigma, charge, ...)
 ```

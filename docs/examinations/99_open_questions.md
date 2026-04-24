@@ -42,20 +42,33 @@ implementation).  The outputs should match to numerical precision.
 
 ---
 
-## Q3 — What is the actual fp32 vs fp64 precision loss in `qline_diff3D`?
+## Q3 — What is the actual fp32 vs fp64 precision loss in `qline_diff3D`?   {#Q3}
 
 **Relates to:** [EFF-01](03_gpu_efficiency.md#fp64), [MEM-02](04_memory.md#fp64-memory)
+**Status:** OPEN — now empirically testable
 
-The analytical integrand in `qline_diff3D_script` (`steps.py:216`) involves:
+The analytical integrand in `qline_diff3D_script` (`steps.py:257`) involves:
 - A ratio of a Gaussian and a line-length-dependent prefactor `Q/(4π Δ)`.
 - Differences of erf values that can be very small when the line is far from
   the evaluation point.
 - Squared terms that can span many orders of magnitude.
 
-Whether float32 is sufficient for physically meaningful precision
-(e.g. 1% accuracy on total charge per pixel) is unknown without testing.
+**Update (commits ce16e9d, 4d8403c):**  
+The `dtype=` parameter is now threaded through all raster helpers.  A
+dedicated dtype smoke test exists:
+```
+uv run pytest tests/effq/test_raster_dtype.py -q
+```
+This tests that fp32 and fp64 both produce finite, positive results with
+consistent shapes.  It does **not** compare numerical precision.
 
-**To resolve:**  
+**Important caveat:**  
+Even in fp32 mode, `compute_index` internally promotes coordinate arithmetic
+to fp64 (`steps.py:91–95`).  The actual performance gain from `dtype=float32`
+will therefore be **less than the theoretical 1/32× to 1/64× speedup**, since
+the index computation still uses fp64.
+
+**To resolve the precision question:**  
 Run `compute_qeff` in both fp32 and fp64 on a representative set of steps
 (including short steps, very oblique steps, and heavily-diffused steps).
 Compare the resulting charge box sums.  Define an acceptable error bound
@@ -160,9 +173,10 @@ largest integrated current in the output.
 
 ---
 
-## Q10 — Does `Raster._transform` correctly handle the `tdim<0` case?
+## Q10 — Does `Raster._transform` correctly handle the `tdim<0` case?   {#Q10}
 
-**Relates to:** `graph.py:240–282`
+**Relates to:** `graph.py:255–302`
+**Status:** OPEN — partial improvement in `Raster.__init__`
 
 `Raster.__init__` adjusts `_tdim` for negative input:
 ```python
@@ -177,6 +191,63 @@ axes.insert(self._tdim, old_tdim)
 The correctness of this reordering under non-default `(pdims, tdim)`
 combinations has not been systematically tested.
 
+**Partial improvement (commit aa91c37):**  
+`Raster.__init__` now validates that `dtype` is a floating-point dtype and
+casts `vaxis` to `int` (via `constant(self, 'vaxis', vaxis, index_dtype)`).
+These provide additional type safety at construction time.  The `_transform`
+logic itself is unchanged.
+
 **To resolve:**  
 Add parametrised unit tests in `tests/` covering at least `tdim=0`, `tdim=-1`,
 and `pdims=(0,1)` with known transformations.
+
+---
+
+## Q11 — Does `compute_index` fp64 promotion need explicit justification?   {#Q11}
+
+**Relates to:** [EFF-15](03_gpu_efficiency.md#compute-index-fp64),
+[MEM-08](04_memory.md#compute-index-fp64)
+
+`compute_index` (`steps.py:79`) unconditionally promotes coordinate arithmetic
+to fp64.  The `_snap_near_integer` guard (`steps.py:49`) adapts its tolerance
+to `source_dtype` (the coarsest dtype among user inputs), but the actual
+subtraction and division are always done in fp64.
+
+**Questions:**
+1. Is fp64 in the subtraction/division actually necessary, or does the
+   `_snap_near_integer` guard + fp32 arithmetic suffice for typical ND-LAr
+   grid spacings and coordinate magnitudes?
+2. If fp64 is necessary, can the promotion be made conditional on
+   `source_dtype == torch.float32` (i.e. only promote when needed) to avoid
+   the overhead when the user already requests fp64?
+
+**To resolve:**  
+Run `compute_index` with fp32 inputs on a set of coordinates near grid
+boundaries (within a few eps of integer multiples of `grid_spacing`) and
+compare the resulting indices against the fp64 reference.  If no mismatches
+are found for typical ND-LAr parameters, fp32 arithmetic may be sufficient.
+
+---
+
+## Q12 — Is the `n_half >= 1` clamp in depos.py correct for zero-sigma depos?   {#Q12}
+
+**Relates to:** [MEM-01](04_memory.md#universal-box), commit a3f3491
+
+`binned_nd` and `binned_1d` now clamp `n_half` to a minimum of 1
+(`depos.py:100, 195`).  For depos with zero sigma (spike depos), the old code
+set `n_half=0` which produced an empty charge box and relied on the `spikes`
+path to assign charge directly to the nearest grid point within a box of size 1.
+
+With the clamp, zero-sigma depos get a 3-voxel box (`2*1+1=3`), the `spikes`
+path still assigns all charge to `rel_gridc`, and the surrounding voxels are
+zero — which is correct.
+
+**Question:**  
+Is the test coverage sufficient to confirm that the `spikes` path correctly
+handles `n_half=1` in all cases, including edge cases where `rel_gridc` could
+be at the boundary of the 3-voxel window?
+
+**To resolve:**  
+Review the existing tests in `tests/effq/test_depos.py` (notably
+`test_binned_1d_zero_width_spike` and `test_binned_nd_zero_width_spike_numerical`)
+and add a case where the zero-sigma depo center is at the edge of a grid cell.

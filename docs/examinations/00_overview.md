@@ -1,6 +1,7 @@
 # TRED Codebase Overview
 
 > Read-only examination.  No source files were modified.
+> Docs pinned to commit **a27a0c9** (24 commits ahead of original snapshot 9f1c714).
 > Cross-references: [01_algorithms.md](01_algorithms.md) [02_bugs.md](02_bugs.md) [03_gpu_efficiency.md](03_gpu_efficiency.md) [04_memory.md](04_memory.md) [99_open_questions.md](99_open_questions.md)
 
 ---
@@ -23,7 +24,10 @@ on every pixel that triggered, equivalent to what the real detector produces.
 ```
 tred/
 ├── src/tred/               # library
-│   ├── graph.py            # nn.Module wrappers for pipeline stages
+│   ├── graph.py            # nn.Module wrappers; Raster dtype= param (aa91c37, ce16e9d);
+│   │                       #   _order_step_endpoints_for_drift_time replaces _ensure_tail_closer_to_anode;
+│   │                       #   _head_time_offset_from_tail replaces _time_diff;
+│   │                       #   sigma distance→time transform now on both depo and step paths (BUG-05, BUG-11 fixed)
 │   ├── blocking.py         # Block data structure (batch of rectangular volumes)
 │   ├── sparse.py           # Block-Sparse Binned (BSB) operations & SGrid
 │   ├── chunking.py         # accumulate(), content(), location() for BSB chunks
@@ -33,8 +37,11 @@ tred/
 │   ├── drift.py            # drift / diffuse / absorb physics
 │   ├── recombination.py    # Birks / Modified-Box recombination models
 │   ├── raster/
-│   │   ├── depos.py        # Gaussian charge boxes for point depos
-│   │   └── steps.py        # Gaussian-weighted line integrals for steps (GL)
+│   │   ├── depos.py        # Gaussian charge boxes for point depos; dtype= parameterised;
+│   │   │                   #   n_half clamped ≥ 1 (a3f3491); linspace device= fixed (17b588b)
+│   │   └── steps.py        # Gaussian-weighted line integrals for steps (GL);
+│   │                       #   dtype= threaded through all helpers (ce16e9d, 4d8403c);
+│   │                       #   DEFAULT_FLOAT_DTYPE replaces float_dtype; _snap_near_integer added
 │   ├── response.py         # Load & reformat ND-LAr field response tensor
 │   ├── convo.py            # Interlaced FFT-based convolution
 │   ├── readout.py          # Discriminator / ADC / CSA model
@@ -144,7 +151,7 @@ The full pipeline is batched at two levels:
 | Name | Where | Shape (example) | Dtype | Description |
 |------|--------|-----------------|-------|-------------|
 | `Block` | `blocking.py` | location (N,3), data (N,Sx,Sy,St) | int32/float32 | Batched sparse volumes |
-| charge box | `raster/steps.py` | (N_steps, Sx, Sy, St) | float64 | Per-step Gaussian integral |
+| charge box | `raster/steps.py` | (N_steps, Sx, Sy, St) | DEFAULT_FLOAT_DTYPE (float64 default, float32 optional) | Per-step Gaussian integral |
 | signal Block | after ChunkSum | (N_chunks, Cx,Cy,Ct) | float32 | Coarse-grid charge |
 | response tensor | `response.py` | (90,90,6400) | float32 | Pixel field response |
 | current Block | after convo | (N_chunks, Cx',Cy',Ct') | float32 | Induced currents |
@@ -160,9 +167,16 @@ The full pipeline is batched at two levels:
   at the start of each batch — this is a single transfer per batch.
 - The response tensor is moved to device once per TPC invocation:
   `response.to(device=device)`.
-- The `raster/steps.py` module uses `float_dtype = torch.float64` throughout.
-  On CUDA GPUs without native FP64 (consumer cards), this imposes a large
-  performance penalty.  See [03_gpu_efficiency.md](03_gpu_efficiency.md#fp64).
+- The `raster/steps.py` module defines `DEFAULT_FLOAT_DTYPE = torch.float64`
+  and all raster helpers default to this dtype.  A `dtype=` keyword is now
+  threaded through all helpers and through `Raster.__init__`, making fp32 an
+  actionable option (commits ce16e9d, 4d8403c).  However, `compute_index`
+  internally promotes coordinates to fp64 regardless of the user-chosen dtype,
+  so the performance gain from fp32 is less than the theoretical maximum.
+  On CUDA GPUs without native FP64 (consumer cards), the default fp64 still
+  imposes a large performance penalty.  See [03_gpu_efficiency.md](03_gpu_efficiency.md#fp64)
+  (EFF-01: OPEN but now actionable) and [03_gpu_efficiency.md](03_gpu_efficiency.md#compute-index-fp64)
+  (EFF-15: transient fp64 in compute_index).
 
 ---
 
@@ -171,6 +185,22 @@ The full pipeline is batched at two levels:
 The repo root contains `itpc_timing_summary.{csv,json}` and
 `pie_chart_{all,noconvo}.png`, suggesting prior per-stage timing on the
 full pipeline.  These are a useful baseline before making optimisations.
+
+---
+
+## Notable Changes Since Snapshot 9f1c714
+
+The following items from the examination docs were updated to reflect commits
+9925b97 through a27a0c9:
+
+| Item | Status | Commit |
+|------|--------|--------|
+| BUG-05 (`_ensure_tail_closer_to_anode` naming/semantics) | **FIXED** | aa91c37 |
+| BUG-11 (depo-path sigma distance→time conversion missing) | **FIXED** | aa91c37 |
+| EFF-01 (fp64 default) | OPEN — fp32 now actionable via `dtype=` | ce16e9d, 4d8403c |
+| EFF-08 (linspace device= in depos loop) | Partial fix — device-transfer half **FIXED** | 17b588b |
+| EFF-15 (transient fp64 in compute_index) | OPEN (new finding) | — |
+| MEM-08 (transient fp64 allocs in compute_index) | OPEN (new finding) | — |
 
 ---
 

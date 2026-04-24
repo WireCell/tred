@@ -20,31 +20,53 @@ The findings below address inefficiencies in each stage.
 
 ---
 
-## EFF-01 — Float64 in entire step-raster module   {#fp64}
+## EFF-01 — Float64 default in step-raster module — now actionable   {#fp64}
 
 **Impact:** high  
 **Change:** structural (precision study needed)  
+**Status:** OPEN — `dtype=float32` is now an actionable option  
 **Location:** `src/tred/raster/steps.py:11`
 
 ```python
-float_dtype = torch.float64
+DEFAULT_FLOAT_DTYPE = torch.float64
 ```
 
-All tensors allocated in `steps.py` are float64.  On consumer/mid-range
-CUDA GPUs (e.g. RTX 3090/4090, A100 40GB), fp64 throughput is
-**1/32× to 1/64×** the fp32 throughput.  This single line multiplies the
-effective compute time of the entire rasterisation stage by up to 64.
+The constant was renamed from `float_dtype` to `DEFAULT_FLOAT_DTYPE` (commit
+ce16e9d).  All tensors allocated in `steps.py` still default to float64.
+On consumer/mid-range CUDA GPUs (e.g. RTX 3090/4090, A100 40GB), fp64
+throughput is **1/32× to 1/64×** the fp32 throughput.
 
-The precision requirement comes from the analytical integrand
-`qline_diff3D_script` which involves differences of erfs and ratios of
-large/small numbers.  A study to determine whether fp32 + compensated
-summation is sufficient, or whether only the critical sub-expressions need
-fp64, would allow a mixed-precision strategy.
+**Update (commit ce16e9d):**  
+A `dtype=` keyword argument is now threaded through all raster helpers
+(`compute_charge_box`, `eval_qeff`, `compute_qeff`, `create_w_block`,
+`create_u_block`, etc.) and through `Raster.__init__` (`graph.py:229`).
+Passing `dtype=torch.float32` to `Raster(... dtype=torch.float32)` or
+`compute_qeff(... dtype=torch.float32)` now runs the full raster pipeline
+in fp32.  This is now directly testable with
+`uv run pytest tests/effq/test_raster_dtype.py -q`.
 
-**Immediate win:**  
-Change `float_dtype = torch.float32` and run validation tests to identify
-which sub-expressions lose accuracy.  Even partial fp32 (compute in fp32,
-accumulate in fp64) would help.
+**Remaining caveat — partial fp64 in `compute_index`:**  
+Even with `dtype=torch.float32`, `compute_index` (`steps.py:79–101`)
+internally promotes the coordinate arithmetic to fp64:
+```python
+coords = to_tensor(coords, device, dtype=torch.float64)   # line 91
+origin = to_tensor(origin, device, dtype=torch.float64)   # line 94
+grid_spacing = to_tensor(grid_spacing, device, dtype=torch.float64)  # line 95
+```
+The index computation (subtraction, division, floor) therefore always runs in
+fp64 regardless of the user-chosen dtype.  The result is cast to `index_dtype`
+(int32) before returning, so no fp64 tensor escapes into the charge evaluation.
+However, this means: (a) the actual performance gain from `dtype=float32` will
+be **less than the theoretical maximum** (since `compute_index` is called twice
+per step — for both min and max bounds — and its fp64 intermediates are not
+negligible); (b) the memory of the index pass is doubled transiently.  See
+also [04_memory.md](04_memory.md#compute-index-fp64).
+
+**Precision requirement:**  
+The analytical integrand `qline_diff3D_script` involves differences of erfs
+and ratios of large/small numbers.  A study to determine whether fp32 is
+sufficient for physically meaningful precision (e.g. 1% per-pixel charge
+accuracy) is still needed.  See [99_open_questions.md](99_open_questions.md#Q3).
 
 ---
 
@@ -218,26 +240,29 @@ called without explicit `device=`.
 
 **Impact:** medium  
 **Change:** structural  
-**Location:** `src/tred/raster/depos.py:193–214`
+**Location:** `src/tred/raster/depos.py:217–239`
 
 ```python
 for dim in range(vdims):
     ...
-    rel_grid_ind = torch.linspace(0, 2*dim_n_half, 2*dim_n_half+1).to(device=device)
+    rel_grid_ind = torch.linspace(0, 2*dim_n_half, 2*dim_n_half+1,
+                                  dtype=dtype, device=device)
     ...
 ```
 
-Two inefficiencies in one loop:
-1. `torch.linspace(...)` returns a CPU tensor; `.to(device=device)` copies it
-   to GPU inside the loop.  Use `device=device` in the `linspace` call.
-2. The loop is a Python-level serialisation over spatial dimensions (vdim=3).
-   While only 3 iterations, each iteration is a separate set of CUDA kernels
-   launched sequentially.  This is a small but avoidable overhead.
+**Partial fix — device-transfer half FIXED in 17b588b:**  
+`torch.linspace` now passes `dtype=dtype, device=device` at the call site
+rather than constructing a CPU tensor and calling `.to(device=device)`.  The
+CPU-allocation-then-copy pattern is gone from `binned_1d` (`depos.py:115`)
+and `binned_nd` (`depos.py:225`).
 
-The comment in the code acknowledges it: `"Suffer per-dimension serialization.
-We do it because linspace() is 1D only."`
+**Still open — Python-level serialisation:**  
+The loop is a Python-level serialisation over spatial dimensions (vdim=3).
+While only 3 iterations, each iteration launches a separate set of CUDA
+kernels sequentially.  The comment in the code acknowledges it:
+`"Suffer per-dimension serialization.  We do it because linspace() is 1D only."`
 
-**Fix:**  
+**Fix direction:**  
 Use `torch.meshgrid` to compute all dimension indices simultaneously, then
 broadcast the erf computation across all dimensions at once.
 
@@ -301,7 +326,8 @@ locs = locs.detach().clone()
 
 This clones the full position tensor before modifying `locs[:,vaxis]`.
 Since `drift()` is called from `Drifter.forward()` which has already cloned
-`tail` in `_ensure_tail_closer_to_anode`, the clone here may be redundant.
+`tail` in `_order_step_endpoints_for_drift_time` (`graph.py:160`), the clone
+here may be redundant.
 If the caller can guarantee no aliasing, `locs[:, vaxis] = target + ...`
 can be done on a view instead.
 
@@ -361,6 +387,32 @@ already-open `h5py.Group` in practice, so this path is never exercised.
 
 ---
 
+## EFF-15 — Transient fp64 tensors in `compute_index` even in fp32 mode   {#compute-index-fp64}
+
+**Impact:** medium  
+**Change:** quick-win  
+**Location:** `src/tred/raster/steps.py:79–101`
+
+Even when the user selects `dtype=torch.float32`, `compute_index` allocates
+three fp64 tensors (`coords`, `origin`, `grid_spacing`) internally for the
+coordinate normalisation step.  These are temporary — the result is cast to
+`index_dtype` (int32) before returning — but they are allocated and live
+during the index computation, which is called twice per step batch
+(for the min and max charge-box bounds).  On a GPU with limited HBM bandwidth,
+fp64 memory traffic is at least as costly as fp32 compute even when the
+tensors are small.
+
+The rationale for the promotion is numerical stability: coordinate subtraction
+and division can lose precision near grid boundaries in fp32, which is why
+`_snap_near_integer` is also applied.  A possible compromise is to use fp64
+only for the subtraction step and immediately cast to fp32 before dividing:
+```python
+idxs = (coords.double() - origin.double()) / grid_spacing  # fp64 sub, fp32 div
+```
+But this requires careful validation.
+
+---
+
 ## Summary table
 
 | ID | Stage | Impact | Change effort |
@@ -379,3 +431,4 @@ already-open `h5py.Group` in practice, so this path is never exercised.
 | EFF-12 | no torch.compile | high (potential) | structural |
 | EFF-13 | fftn → rfftn | medium | quick-win |
 | EFF-14 | hdf_keys typo | low | quick-win |
+| EFF-15 | fp64 in compute_index (even in fp32 mode) | medium | quick-win |

@@ -54,8 +54,10 @@ Models three physical processes for each step / depo:
    Binomial fluctuation on top.
 
 All three operations are vectorised over (N_steps,).  The `Drifter` nn.Module
-(`graph.py:67`) wraps these and adds a swap to ensure the "tail" is always
-the point closer to the anode.
+(`graph.py:68`) wraps these and, when both `tail` and `head` are provided,
+calls `_order_step_endpoints_for_drift_time` to establish a consistent ordering
+before computing drift time.  See the section below for the semantics of this
+ordering.
 
 Optional time-shift correction `drtoa` converts anode-plane drift time to
 response-plane drift time.
@@ -81,21 +83,36 @@ Notable: `locs.detach().clone()` copies the position tensor every call
 For point-like depos, computes the effective charge on each grid voxel by
 integrating the 3-D Gaussian distribution over each voxel.
 
-The N-D version (`binned_nd`, `raster/depos.py:128`) works as follows:
+The N-D version (`binned_nd`, `raster/depos.py:142`) works as follows:
 
 1. Compute per-depo, per-dimension half-span `n_half`:
-   how many grid points are needed to cover ±nsigma×sigma.  **Critically,
-   the maximum over all depos is taken**, creating a universal box shape.
+   how many grid points are needed to cover ±nsigma×sigma via
+   `torch.ceil((sigmas * nsigma) / grid)`, then clamped to a minimum of 1:
+   `n_half = torch.clamp(n_half, min=1)` (`raster/depos.py:194–195`).
+   This ensures the minimum charge-box buffer is always at least 1 grid point
+   per dimension, preventing the zero-size buffer that was possible before
+   commit a3f3491 when sigma was very small.
+   **Critically, the maximum over all depos is taken**, creating a universal
+   box shape.
 2. Build the `grid0` lower corner for each depo.
-3. Loop over spatial dimensions (Python `for` loop, `raster/depos.py:193`).
+3. Loop over spatial dimensions (Python `for` loop, `raster/depos.py:217`).
    For each dimension:
-   a. Construct relative grid point indices via `torch.linspace`.
+   a. Construct relative grid point indices via `torch.linspace(0, 2*dim_n_half,
+      ..., dtype=dtype, device=device)` — device and dtype are now passed at
+      call time rather than via a `.to(device)` follow-up call (commit 17b588b).
    b. Convert to absolute coordinates.
    c. Compute `erf` values at bin edges.
    d. Compute bin integrals as half the difference of adjacent erfs.
+   e. The spike index for zero-width depos is cast to `torch.long` before use:
+      `rel_gridc[spikes, dim].to(dtype=torch.long)` (`raster/depos.py:239`),
+      fixing a prior bug where the index dtype was not guaranteed to be long.
 4. Form the N-D charge box as the outer product of per-dimension integrals via
    `torch.einsum` (for N=2 or N=3).
 5. Multiply by Q.
+
+Both `binned_1d` and `binned_nd` accept a `dtype=` keyword (defaulting to
+`DEFAULT_FLOAT_DTYPE = torch.float64`, `raster/depos.py:62`); all tensors
+allocated internally are cast to this dtype.
 
 **Output:** `(qeff, grid0)` where `qeff` has shape `(N_depos, 2*n_half[0]+1,
 2*n_half[1]+1, 2*n_half[2]+1)` and `grid0` has shape `(N_depos, vdim)`.
@@ -120,7 +137,7 @@ one of two evaluation methods:
 
 **Method `gauss_legendre`** (default):
 Uses Gauss–Legendre quadrature to numerically integrate the charge density
-`qline_diff3D` (`steps.py:190`) at GL nodes within each grid voxel, then
+`qline_diff3D` (`steps.py:232`) at GL nodes within each grid voxel, then
 sums the weighted values.  The analytical integrand is:
 
 ```
@@ -129,29 +146,139 @@ q(x,y,z) = Q / (4π Δ) * exp(-sy²(x*dz01 + ...) / (2Δ²))
 ```
 where `Δ = sqrt(sy²sz²*dx01² + sx²sy²*dz01² + sx²sz²*dy01²)` (the
 denominator encoding the line-spread geometry).  This is computed as a
-TorchScript function (`qline_diff3D_script`, `steps.py:216`) for JIT speed.
+TorchScript function (`qline_diff3D_script`, `steps.py:257`) for JIT speed.
 
 The GL quadrature uses `npoints=(2,2,2)` by default (8 evaluation nodes per
 voxel), with weights pre-computed once via `create_wu_block`.
 
 **Short step fallback**: steps shorter than 5% of the sigma along any
-dimension are treated as point depos (`qpoint_diff3D`, `steps.py:279`).
+dimension are treated as point depos (`qpoint_diff3D`, `steps.py:321`).
 
 ### Universal shape
-Same issue as depos: `reduce_to_universal` (`steps.py:112`) collapses all
+Same issue as depos: `reduce_to_universal` (`steps.py:150`) collapses all
 per-step box shapes to the per-batch maximum before allocating, so every
 step's charge box is padded to the worst-case size.
 See [04_memory.md](04_memory.md#universal-box).
 
-### Float64 usage
-The entire `steps.py` module uses `float_dtype = torch.float64` (line 11).
-The analytical integrand requires precision, but fp64 on consumer CUDA GPUs
-runs at 1/32× of fp32 throughput.
+### Default float dtype and `dtype=` parameter
+The module defines `DEFAULT_FLOAT_DTYPE = torch.float64` (`steps.py:11`).
+This constant replaces the old bare `float_dtype` variable.  All public
+functions (`compute_bounds_X0X1`, `compute_bounds_X0_X1`, `compute_charge_box`,
+`create_w_block`, `create_u_block`, `create_wu_block`, `eval_qeff`,
+`compute_qeff`, etc.) now accept an explicit `dtype=` keyword argument
+(defaulting to `DEFAULT_FLOAT_DTYPE`) which is threaded through all
+tensor allocations and `to_tensor` calls.  Passing `dtype=torch.float32`
+allows the full raster pipeline to run in fp32.
+
+### `_snap_near_integer` — boundary jitter guard  (`steps.py:49`)
+```python
+def _snap_near_integer(values: Tensor, source_dtype):
+    nearest = torch.round(values)
+    eps = torch.finfo(source_dtype).eps
+    tol = 8 * eps * torch.clamp(nearest.abs(), min=1.0)
+    return torch.where((values - nearest).abs() <= tol, nearest, values)
+```
+Before flooring the normalised coordinate `(coord − origin)/spacing` to get
+the grid index, `_snap_near_integer` detects values that lie within `8 eps`
+of an integer boundary and snaps them exactly to that integer.  Without this
+guard, fp32/fp64 boundary jitter can cause a coordinate that is conceptually
+exactly on a grid line to floor to the wrong cell, producing charge-box index
+errors.  `source_dtype` is the coarsest float dtype among the inputs (computed
+by `_coarsest_float_dtype`), so the tolerance adapts to the actual precision in
+use.
+
+### Internal fp64 promotion in `compute_index`  (`steps.py:79`)
+Even when `dtype=torch.float32` is requested, `compute_index` promotes the
+coordinate arithmetic to fp64 internally:
+```python
+coords  = to_tensor(coords,  device, dtype=torch.float64)   # line 91
+origin  = to_tensor(origin,  device, dtype=torch.float64)   # line 94
+grid_spacing = to_tensor(grid_spacing, device, dtype=torch.float64) # line 95
+idxs = (coords - origin.unsqueeze(0)) / grid_spacing.unsqueeze(0)  # fp64
+idxs = _snap_near_integer(idxs, source_dtype)
+return idxs.floor().to(index_dtype)                          # cast back
+```
+The `source_dtype` passed to `_snap_near_integer` is determined before
+promotion via `_coarsest_float_dtype`, so the tolerance reflects the
+user-chosen precision.  The result is always cast to `index_dtype`
+(int32) — there is no fp64 tensor surviving from `compute_index` into
+the charge evaluation.  However, fp64 tensors **do** live transiently
+inside `compute_index`, doubling the memory of the index computation pass
+regardless of the user-chosen dtype.  See [03_gpu_efficiency.md](03_gpu_efficiency.md#fp64)
+and [04_memory.md](04_memory.md#compute-index-fp64).
+
+### Float64 usage (overall)
 See [03_gpu_efficiency.md](03_gpu_efficiency.md#fp64).
 
 ---
 
-## 5. Block Data Structure (`blocking.py`)
+## 5. `Raster` nn.Module (`graph.py:224`) — naming, dtype, and sigma transform
+
+### dtype parameter
+`Raster.__init__` now accepts a `dtype=` argument (default `torch.float64`,
+`graph.py:229`).  It is stored as `self._dtype` and validated at construction
+time:
+```python
+if not torch.empty((), dtype=dtype).is_floating_point():
+    raise ValueError('Raster dtype must be a floating-point torch.dtype')
+```
+All input tensors in `Raster.forward` are cast to `self._dtype` before being
+passed to the raster helpers.  The `dtype=` is forwarded to `raster_steps`
+and `raster_depos` (via `raster_steps(... dtype=self._dtype)` and
+`raster_depos(... dtype=self._dtype)`) so the full raster computation runs at
+the chosen precision.
+
+### `_order_step_endpoints_for_drift_time` (renamed from `_ensure_tail_closer_to_anode`)
+
+**FIXED in aa91c37.**  The static method previously named
+`_ensure_tail_closer_to_anode` is now named
+`_order_step_endpoints_for_drift_time` (`graph.py:160`).
+
+**Semantics (current):**  
+The method reorders `(tail, head)` so that `tail` is the **upstream**
+endpoint — i.e. the endpoint farther from the anode:
+- If `velocity > 0`, tail ends up with the **smaller** coordinate along
+  `vaxis` (farther from the anode for positive-velocity drift).
+- If `velocity < 0`, tail ends up with the **larger** coordinate along
+  `vaxis`.
+
+This makes `tail` the endpoint used to define the drift time in
+`Drifter.forward()`.  The name change reflects that the ordering is based on
+drift direction, not a direct comparison to the anode position.  The old name
+`_ensure_tail_closer_to_anode` had **inverted semantics** — the tail is now
+documented as the upstream (farther-from-anode) endpoint, not the closer one.
+See [02_bugs.md](02_bugs.md#tail-swap) for the original bug record.
+
+### `_head_time_offset_from_tail` (renamed from `_time_diff`)
+The method computing the head-time offset from tail time is now named
+`_head_time_offset_from_tail` (`graph.py:257`):
+```python
+def _head_time_offset_from_tail(self, tail, head=None):
+    ...
+    d = tail - head  (for 1D)  or  tail[:,tdim] - head[:,tdim]
+    return d / self.velocity
+```
+This returns `(tail_coord - head_coord) / velocity`, which is the time to
+add to the tail time to obtain the head time.
+
+### Sigma distance-to-time transform — both depo and step paths
+
+**FIXED in aa91c37.**  In `Raster.forward` (`graph.py:304`), the
+distance-to-time conversion for the drift-axis sigma:
+```python
+sigma[:, self._tdim] = sigma[:, self._tdim] / torch.abs(self.velocity)
+```
+is now applied **before** the step/depo branch (`graph.py:331`).  This means
+both the depo path (`raster_depos`) and the step path (`raster_steps`) receive
+sigma already in time units along the drift axis.
+
+Previously this transform was only applied on the step path; the depo path
+received sigma in distance units, causing incorrect charge spread along the
+drift axis for point depos.  See [02_bugs.md](02_bugs.md#depo-sigma-units).
+
+---
+
+## 6. Block Data Structure (`blocking.py`)  {#block-data-structure}
 
 A `Block` is the central data container throughout TRED.  It holds:
 - `location`: (N_batches, vdim) int32 tensor — absolute grid-index of the
@@ -168,7 +295,7 @@ Helper: `concat_blocks(blocks)` — concatenates along the batch dimension.
 
 ---
 
-## 6. Block-Sparse Accumulation (`sparse.py` / `chunking.py`)
+## 7. Block-Sparse Accumulation (`sparse.py` / `chunking.py`)
 
 ### The central problem
 After rastering, each step produces one charge box (a Block batch element)
@@ -216,7 +343,7 @@ bugs under certain configurations — see [02_bugs.md](02_bugs.md#v2-scatter).
 
 ---
 
-## 7. Interlaced Convolution (`convo.py` / `partitioning.py`)
+## 8. Interlaced Convolution (`convo.py` / `partitioning.py`)
 
 ### Motivation
 The ND-LAr pixel response tensor represents the induced current at a pixel
@@ -255,7 +382,7 @@ would be a significant speedup.  See [03_gpu_efficiency.md](03_gpu_efficiency.md
 
 ---
 
-## 8. Readout (`readout.py`)
+## 9. Readout (`readout.py`)
 
 ### What it does
 Models the pixel electronics chain:
@@ -282,7 +409,7 @@ See [03_gpu_efficiency.md](03_gpu_efficiency.md#readout-loop).
 
 ---
 
-## 9. Response Loading (`response.py`)
+## 10. Response Loading (`response.py`)
 
 ### What it does
 Loads the ND-LAr field response `.npy` file (shape `(45, 45, 6400)` — quarter
@@ -304,7 +431,7 @@ the entire run.
 
 ---
 
-## 10. IO and Loaders (`loaders.py`, `io_nd.py`)
+## 11. IO and Loaders (`loaders.py`, `io_nd.py`)
 
 ### StepLoader / steps_from_ndh5
 Reads steps from an HDF5 file as NumPy arrays via h5py, converts to

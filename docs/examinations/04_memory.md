@@ -16,16 +16,20 @@ The GPU memory high-water mark is reached during the **rasterisation** or
 Shape per batch of `N_steps` steps with universal box size `(Sx, Sy, St)`:
 
 ```
-charge_boxes: (N_steps, Sx, Sy, St)  dtype=float64
+charge_boxes: (N_steps, Sx, Sy, St)  dtype=DEFAULT_FLOAT_DTYPE (float64 by default)
 ```
 
 Typical values: `N_steps = 32768`, `Sx = Sy ≈ 5–30`, `St ≈ 5–50`.
 
 **Example:** 32768 steps × 20 × 20 × 20 voxels × 8 bytes (float64) = **2.1 GB**
 
+With `dtype=torch.float32` (now a user-selectable option via `Raster(dtype=...)`)
+this halves to **1.05 GB**.  See [03_gpu_efficiency.md](03_gpu_efficiency.md#fp64).
+
 This is before any accumulation.  The charge boxes must coexist with the
 offset tensor `(N_steps, 3)` (int32, negligible) and intermediate tensors
-in `compute_qeff`.
+in `compute_qeff`, including transient fp64 allocations in `compute_index`
+— see MEM-08 below.
 
 ### 1.2 Envelope (chunkify)
 
@@ -75,8 +79,19 @@ For larger chunk batches or larger `o_shape`, this scales linearly.
 ### MEM-01 — Universal box shape inflates charge-box tensor   {#universal-box}
 
 **Savings potential:** high  
-**Location:** `src/tred/raster/depos.py:176`,
-`src/tred/raster/steps.py:112–124` (`reduce_to_universal`)
+**Location:** `src/tred/raster/depos.py:193–201`,
+`src/tred/raster/steps.py:150–162` (`reduce_to_universal`)
+
+**Update (commit a3f3491):**  
+`n_half` in `binned_nd` and `binned_1d` is now clamped to a minimum of 1:
+`n_half = torch.clamp(n_half, min=1)` (`depos.py:100, 195`).
+Previously `n_half` could be 0 for depos with very small sigma relative to
+the grid spacing, resulting in a zero-size charge buffer that would produce
+incorrect (empty) rasters.  The minimum-1 clamp means the smallest possible
+charge box is now 3 voxels wide per dimension (2×1+1), which avoids the
+zero-size bug and also means very narrow depos always consume at least a
+3^N voxel buffer rather than collapsing to nothing.  This is a slight
+**increase** in minimum memory for tiny-sigma depos, but avoids corruption.
 
 Both raster paths compute the largest box needed by any step in the batch
 and pad **all** steps to that size.  For a batch containing a mix of MIP
@@ -110,13 +125,16 @@ c. **Reduce `N_steps` per batch**: reducing `batch_scheme[0]` from 32768
 **Savings potential:** high  
 **Location:** `src/tred/raster/steps.py:11`
 
-`float_dtype = torch.float64` means every charge box element uses 8 bytes
-instead of 4 bytes for float32.  For the example in §1.1, this is the
-difference between 2.1 GB and 1.05 GB for the charge box tensor, and
+`DEFAULT_FLOAT_DTYPE = torch.float64` means every charge box element uses
+8 bytes instead of 4 bytes for float32.  For the example in §1.1, this is
+the difference between 2.1 GB and 1.05 GB for the charge box tensor, and
 between 1.5 GB and 0.75 GB for the envelope.
 
-Converting to float32 (or mixed precision) would approximately **halve** the
-memory of the rasterisation stage.  See also
+A `dtype=torch.float32` path is now available via `Raster(dtype=torch.float32)`
+(commit ce16e9d), which would approximately **halve** the memory of the
+rasterisation stage.  However, `compute_index` still allocates transient fp64
+tensors internally even in fp32 mode (see MEM-08), so the peak memory saving
+is somewhat less than 50%.  See also
 [03_gpu_efficiency.md §EFF-01](03_gpu_efficiency.md#fp64).
 
 ---
@@ -148,7 +166,7 @@ Clones the full `(N_steps, 3)` position tensor on every drift call.
 For 32768 steps, this is 32768 × 3 × 4 bytes = 384 KB — small but
 unnecessary if the caller guarantees no aliasing.
 
-Similarly `_ensure_tail_closer_to_anode` (`graph.py:188`) clones both
+Similarly `_order_step_endpoints_for_drift_time` (`graph.py:197`) clones both
 `tail` and `head` before any check of whether a swap is needed:
 
 ```python
@@ -237,6 +255,28 @@ throughout, avoiding the sync entirely.
 
 ---
 
+### MEM-08 — Transient fp64 allocations inside `compute_index`   {#compute-index-fp64}
+
+**Savings potential:** low–medium (affects index pass only)  
+**Location:** `src/tred/raster/steps.py:79–101`
+
+Even with `dtype=torch.float32`, `compute_index` promotes `coords`, `origin`,
+and `grid_spacing` to fp64 for the normalisation arithmetic (`steps.py:91–95`).
+These three fp64 tensors are temporary — they are freed before the function
+returns — but during their lifetime they double the memory of the coordinate
+tensors in the charge-box bounding-box computation.
+
+`compute_index` is called twice per batch: once for the min-limit corners and
+once for the max-limit corners in `compute_charge_box` (`steps.py:197–199`).
+Each call holds fp64 copies of tensors of shape `(N_steps, vdim)`.
+
+**Memory overhead per call:**  
+`N_steps × vdim × 8 bytes = 32768 × 3 × 8 = 786 KB` — small in absolute
+terms but the coexistence with the main fp32 charge-box tensor means the
+working set is briefly mixed-precision.
+
+---
+
 ## 3. Peak Memory Estimates for a Typical ND-LAr Batch
 
 Assuming: N_steps=32768, universal box 20×20×30, chunk_shape=(40,40,32),
@@ -263,8 +303,10 @@ the envelope (MEM-01, MEM-02, MEM-03) could bring peak below 3 GB.
 
 Ordered by expected saving with minimal risk:
 
-1. **float32 in `raster/steps.py`** — halves raster stage memory (~1.2 GB).
-   Risk: precision — needs validation.
+1. **float32 in `raster/steps.py`** — now selectable via `Raster(dtype=torch.float32)`
+   (commit ce16e9d); approximately halves raster stage memory (~1.2 GB, minus
+   the transient fp64 in `compute_index` — see MEM-08).
+   Risk: precision — needs validation via `test_raster_dtype.py`.
 2. **`del meas` after ifftn in `convo.py`** — frees the accumulator complex
    tensor (~2 GB at peak) before returning real part.  No correctness risk.
 3. **Reduce batch size** (`batch_scheme[0]`) — immediate, configuration-only.
